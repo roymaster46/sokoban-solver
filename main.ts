@@ -1,353 +1,71 @@
-// Sokoban solver: push-optimal per room (rooms are independent: a box pushed
-// into the hallway can never come back, so the level optimum is the sum of the
-// room optima). Each room is solved with push-A* + min-assignment heuristic.
-import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-
-const I = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const O = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-
-// up, down, left, right
-const DX = [0, 0, -1, 1];
-const DY = [-1, 1, 0, 0];
-const LETTER = ['u', 'd', 'l', 'r'];
-// Expansion budget per room, counted in work (never the wall clock), so two
-// runs always agree.
-const EXPANSIONS = 1_000_000;
-
-type Push = { from: number; dir: number };
-
-function solve(text: string): string {
-  const rows = text.split('\n').filter((r) => r.length > 0);
-  const h = rows.length;
-  const w = Math.max(...rows.map((r) => r.length));
-  const open: boolean[] = [];
-  const isGoal: boolean[] = [];
-  let allBoxes: number[] = [];
-  let player = 0;
-  rows.forEach((row, y) => {
-    for (let x = 0; x < w; x++) {
-      const ch = row[x] ?? '#';
-      const i = y * w + x;
-      open[i] = ch !== '#';
-      isGoal[i] = '.*+'.includes(ch);
-      if ('$*'.includes(ch)) allBoxes.push(i);
-      if ('@+'.includes(ch)) player = i;
-    }
-  });
-  const py = Math.floor(player / w);
-  const at = (x: number, y: number): number => y * w + x;
-  const inside = (x: number, y: number): boolean => x >= 0 && y >= 0 && x < w && y < h;
-
-  // Rooms: connected components of open cells off the hallway row.
-  const seen = new Set<number>();
-  const rooms: number[][] = [];
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const i = at(x, y);
-      if (y === py || !open[i] || seen.has(i)) continue;
-      const cells: number[] = [];
-      const q = [i];
-      seen.add(i);
-      while (q.length > 0) {
-        const c = q.pop()!;
-        cells.push(c);
-        for (let d = 0; d < 4; d++) {
-          const nx = (c % w) + DX[d]!;
-          const ny = Math.floor(c / w) + DY[d]!;
-          if (ny === py || !inside(nx, ny)) continue;
-          const n = at(nx, ny);
-          if (open[n] && !seen.has(n)) {
-            seen.add(n);
-            q.push(n);
-          }
-        }
-      }
-      rooms.push(cells);
-    }
-  }
-
-  // BFS walk on a floor set (boolean array), blocked by `blocked` cells.
-  // Returns the move string from `from` to `to`, or null if unreachable.
-  const walk = (from: number, to: number, floor: boolean[], blocked: Set<number>): string | null => {
-    if (from === to) return '';
-    const prev = new Map<number, number>();
-    const prevDir = new Map<number, number>();
-    const q = [from];
-    prev.set(from, -1);
-    for (let head = 0; head < q.length; head++) {
-      const c = q[head]!;
-      for (let d = 0; d < 4; d++) {
-        const nx = (c % w) + DX[d]!;
-        const ny = Math.floor(c / w) + DY[d]!;
-        if (!inside(nx, ny)) continue;
-        const n = at(nx, ny);
-        if (!floor[n] || blocked.has(n) || prev.has(n)) continue;
-        prev.set(n, c);
-        prevDir.set(n, d);
-        if (n === to) {
-          let moves = '';
-          let cur = n;
-          while (cur !== from) {
-            moves = LETTER[prevDir.get(cur)!]! + moves;
-            cur = prev.get(cur)!;
-          }
-          return moves;
-        }
-        q.push(n);
-      }
-    }
-    return null;
-  };
-
-  // Flood fill from `from` over `floor` minus `blocked`; returns the set.
-  const reach = (from: number, floor: boolean[], blocked: Set<number>): Set<number> => {
-    const out = new Set<number>([from]);
-    const q = [from];
-    for (let head = 0; head < q.length; head++) {
-      const c = q[head]!;
-      for (let d = 0; d < 4; d++) {
-        const nx = (c % w) + DX[d]!;
-        const ny = Math.floor(c / w) + DY[d]!;
-        if (!inside(nx, ny)) continue;
-        const n = at(nx, ny);
-        if (floor[n] && !blocked.has(n) && !out.has(n)) {
-          out.add(n);
-          q.push(n);
-        }
-      }
-    }
-    return out;
-  };
-
-  // Solve one room with push-A*. `entry` is the hallway cell in front of the
-  // door; the player starts there and may stand on it. Boxes may only move
-  // inside the room. Returns the push list, or null.
-  const solveRoom = (cells: number[], boxes0: number[], entry: number, door: number, needExit: boolean): Push[] | null => {
-    const inRoom = new Set(cells);
-    const floor: boolean[] = [];
-    for (const c of cells) floor[c] = true;
-    floor[entry] = true;
-    const goals = cells.filter((c) => isGoal[c]);
-    const blocked = (c: number): boolean => !floor[c];
-    // All-pairs BFS distances over room cells (no boxes): the heuristic base.
-    const dist = new Map<number, Map<number, number>>();
-    for (const s of cells) {
-      const d = new Map<number, number>([[s, 0]]);
-      const q = [s];
-      for (let head = 0; head < q.length; head++) {
-        const c = q[head]!;
-        for (let k = 0; k < 4; k++) {
-          const nx = (c % w) + DX[k]!;
-          const ny = Math.floor(c / w) + DY[k]!;
-          if (!inside(nx, ny)) continue;
-          const n = at(nx, ny);
-          if (inRoom.has(n) && !d.has(n)) {
-            d.set(n, d.get(c)! + 1);
-            q.push(n);
-          }
-        }
-      }
-      dist.set(s, d);
-    }
-    // Min-assignment heuristic over all box->goal permutations (<= 4! = 24).
-    const heuristic = (bs: number[]): number => {
-      let best = Infinity;
-      const used = new Array<boolean>(goals.length).fill(false);
-      const go = (i: number, acc: number): void => {
-        if (acc >= best) return;
-        if (i === bs.length) {
-          best = acc;
-          return;
-        }
-        for (let j = 0; j < goals.length; j++) {
-          if (used[j]) continue;
-          const d = dist.get(bs[i]!)!.get(goals[j]!);
-          if (d === undefined) continue;
-          used[j] = true;
-          go(i + 1, acc + d);
-          used[j] = false;
-        }
-      };
-      go(0, 0);
-      return best;
-    };
-    // Sound deadlock checks: a box that can never move again.
-    const deadlocked = (bs: number[]): boolean => {
-      const set = new Set(bs);
-      for (const b of bs) {
-        if (isGoal[b]) continue;
-        const x = b % w;
-        const y = Math.floor(b / w);
-        // Corner: two perpendicular neighbours blocked.
-        const up = !inside(x, y - 1) || blocked(at(x, y - 1));
-        const down = !inside(x, y + 1) || blocked(at(x, y + 1));
-        const left = !inside(x - 1, y) || blocked(at(x - 1, y));
-        const right = !inside(x + 1, y) || blocked(at(x + 1, y));
-        if ((up || down) && (left || right)) return true;
-        // 2x2 block of boxes/walls with no goal inside.
-        for (const [ox, oy] of [[0, 0], [-1, 0], [0, -1], [-1, -1]] as const) {
-          const sq = [at(x + ox, y + oy), at(x + ox + 1, y + oy), at(x + ox, y + oy + 1), at(x + ox + 1, y + oy + 1)];
-          if (sq.some((c) => isGoal[c])) continue;
-          if (sq.every((c) => set.has(c) || !inside(c % w, Math.floor(c / w)) || blocked(c))) return true;
-        }
-      }
-      return false;
-    };
-    const canon = (p: number, bs: number[]): number => {
-      let m = Infinity;
-      for (const c of reach(p, floor, new Set(bs))) if (c < m) m = c;
-      return m;
-    };
-    const keyOf = (p: number, bs: number[]): string => String.fromCharCode(p, ...bs);
-    const startBoxes = [...boxes0].sort((a, b) => a - b);
-    const startPlayer = canon(entry, startBoxes);
-    // A* nodes.
-    const nBoxes: number[][] = [startBoxes];
-    const nPlayer: number[] = [startPlayer];
-    const nG: number[] = [0];
-    const nParent: number[] = [-1];
-    const nPush: Push[] = [{ from: -1, dir: -1 }];
-    const best = new Map<string, number>([[keyOf(startPlayer, startBoxes), 0]]);
-    // Heap of [f, seq, node]; smaller f first, then earlier seq.
-    const heap: [number, number, number][] = [];
-    let seq = 0;
-    const heapLess = (a: [number, number, number], b: [number, number, number]): boolean =>
-      a[0] < b[0] || (a[0] === b[0] && a[1] < b[1]);
-    const heapPush = (e: [number, number, number]): void => {
-      let i = heap.length;
-      heap.push(e);
-      while (i > 0) {
-        const p = (i - 1) >> 1;
-        if (!heapLess(heap[i]!, heap[p]!)) break;
-        [heap[i], heap[p]] = [heap[p]!, heap[i]!];
-        i = p;
-      }
-    };
-    const heapPop = (): [number, number, number] => {
-      const top = heap[0]!;
-      const last = heap.pop()!;
-      if (heap.length > 0) {
-        heap[0] = last;
-        for (let i = 0; ; ) {
-          let c = 2 * i + 1;
-          if (c >= heap.length) break;
-          if (c + 1 < heap.length && heapLess(heap[c + 1]!, heap[c]!)) c++;
-          if (!heapLess(heap[c]!, heap[i]!)) break;
-          [heap[i], heap[c]] = [heap[c]!, heap[i]!];
-          i = c;
-        }
-      }
-      return top;
-    };
-    const h0 = heuristic(startBoxes);
-    if (h0 === Infinity || deadlocked(startBoxes)) return null;
-    heapPush([h0, seq++, 0]);
-    let expanded = 0;
-    while (heap.length > 0 && expanded < EXPANSIONS) {
-      const [, , s] = heapPop();
-      const bs = nBoxes[s]!;
-      const p = nPlayer[s]!;
-      const g = nG[s]!;
-      if (best.get(keyOf(p, bs)) !== g) continue;
-      if (bs.every((b) => isGoal[b])) {
-        if (!needExit || reach(p, floor, new Set(bs)).has(door)) {
-          const pushes: Push[] = [];
-          for (let t = s; t > 0; t = nParent[t]!) pushes.push(nPush[t]!);
-          pushes.reverse();
-          return pushes;
-        }
-      }
-      expanded++;
-      const region = reach(p, floor, new Set(bs));
-      const boxSet = new Set(bs);
-      for (let bi = 0; bi < bs.length; bi++) {
-        const b = bs[bi]!;
-        for (let d = 0; d < 4; d++) {
-          const nx = (b % w) + DX[d]!;
-          const ny = Math.floor(b / w) + DY[d]!;
-          if (!inside(nx, ny)) continue;
-          const t = at(nx, ny);
-          const pusher = at((b % w) - DX[d]!, Math.floor(b / w) - DY[d]!);
-          if (!floor[t] || boxSet.has(t) || !region.has(pusher)) continue;
-          const nb = bs.slice();
-          nb[bi] = t;
-          nb.sort((a, b2) => a - b2);
-          if (deadlocked(nb)) continue;
-          const h = heuristic(nb);
-          if (h === Infinity) continue;
-          const np = canon(b, nb);
-          const k = keyOf(np, nb);
-          if (best.has(k)) continue;
-          const idx = nBoxes.length;
-          nBoxes.push(nb);
-          nPlayer.push(np);
-          nG.push(g + 1);
-          nParent.push(s);
-          nPush.push({ from: b, dir: d });
-          best.set(k, g + 1);
-          heapPush([g + 1 + h, seq++, idx]);
-        }
-      }
-    }
-    return null;
-  };
-
-  // Solve rooms in scan order; a room that cannot be solved with an exit is
-  // deferred to the end (solved without needing an exit).
-  let moves = '';
-  let curPlayer = player;
-  const deferred: number[][] = [];
-  const doRoom = (cells: number[], needExit: boolean): boolean => {
-    const boxes0 = cells.filter((c) => allBoxes.includes(c));
-    const doors = cells.filter((c) => {
-      const x = c % w;
-      const y = Math.floor(c / w);
-      for (let d = 0; d < 4; d++) {
-        const nx = x + DX[d]!;
-        const ny = y + DY[d]!;
-        if (ny === py && inside(nx, ny) && open[at(nx, ny)]) return true;
-      }
-      return false;
-    });
-    if (doors.length === 0) return false;
-    const door = doors[0]!;
-    const entry = at(door % w, py);
-    const pushes = solveRoom(cells, boxes0, entry, door, needExit);
-    if (pushes === null) return false;
-    // Replay the pushes into walks + push letters.
-    const roomFloor: boolean[] = [];
-    for (const c of cells) roomFloor[c] = true;
-    roomFloor[entry] = true;
-    // Walk from the current player to this room's entry first.
-    const w0 = walk(curPlayer, entry, open, new Set(allBoxes));
-    if (w0 === null) return false;
-    moves += w0;
-    curPlayer = entry;
-    let curBoxes = [...boxes0].sort((a, b) => a - b);
-    for (const { from, dir } of pushes) {
-      const pusher = at((from % w) - DX[dir]!, Math.floor(from / w) - DY[dir]!);
-      const wk = walk(curPlayer, pusher, roomFloor, new Set(curBoxes));
-      if (wk === null) return false;
-      moves += wk + LETTER[dir]!;
-      const t = at((from % w) + DX[dir]!, Math.floor(from / w) + DY[dir]!);
-      curBoxes = curBoxes.map((b) => (b === from ? t : b)).sort((a, b) => a - b);
-      curPlayer = from;
-      allBoxes = allBoxes.map((b) => (b === from ? t : b));
-    }
-    return true;
-  };
-  for (const cells of rooms) {
-    if (!doRoom(cells, true)) deferred.push(cells);
-  }
-  for (const cells of deferred) {
-    if (!doRoom(cells, false)) return '';
-  }
-  return moves;
-}
-
-for (const id of readdirSync(I).sort()) {
-  const moves = solve(readFileSync(join(I, id, 'level.txt'), 'utf8'));
-  mkdirSync(join(O, id), { recursive: true });
-  writeFileSync(join(O, id, 'solution.txt'), `${moves}\n`);
-}
+import{mkdirSync,readdirSync,readFileSync,writeFileSync}from'node:fs';
+import{join}from'node:path';
+const I=process.env.MAKEFUN_INPUT_DIR??'/input',O=process.env.MAKEFUN_OUTPUT_DIR??'/output';
+const D=[[0,-1],[0,1],[-1,0],[1,0]],L='udlr';
+function solve(t){
+ const R=t.split('\n').filter(r=>r),H=R.length,W=Math.max(...R.map(r=>r.length));
+ const F=[],Y=[];let B=[],P=0;
+ R.forEach((r,y)=>{for(let x=0;x<W;x++){let c=r[x]||'#',i=y*W+x;F[i]=c!='#';Y[i]='.*+'.includes(c);if('$*'.includes(c))B.push(i);if('@+'.includes(c))P=i}});
+ const py=P/W|0,ib=(x,y)=>x>=0&&y>=0&&x<W&&y<H;
+ const bfs=(s,fl,bl)=>{const m=new Map([[s,-1]]),q=[s];for(let h=0;h<q.length;h++){let c=q[h];for(let k=0;k<4;k++){let x=c%W+D[k][0],y=(c/W|0)+D[k][1];if(ib(x,y)){let n=y*W+x;if(fl[n]&&!bl.has(n)&&!m.has(n)){m.set(n,c);q.push(n)}}}}return m};
+ const walk=(a,b,fl,bl)=>{if(a===b)return'';const m=bfs(a,fl,bl);if(!m.has(b))return null;let s='',c=b;while(c!==a){let p=m.get(c),dx=c%W-p%W,dy=(c/W|0)-(p/W|0);s=(dy<0?'u':dy>0?'d':dx<0?'l':'r')+s;c=p}return s};
+ const seen=new Set(),rooms=[];
+ for(let y=0;y<H;y++)for(let x=0;x<W;x++){let i=y*W+x;if(y===py||!F[i]||seen.has(i))continue;let cs=[],q=[i];seen.add(i);while(q.length){let c=q.pop();cs.push(c);for(let k=0;k<4;k++){let nx=c%W+D[k][0],ny=(c/W|0)+D[k][1];if(ny!==py&&ib(nx,ny)){let n=ny*W+nx;if(F[n]&&!seen.has(n)){seen.add(n);q.push(n)}}}}rooms.push(cs)}
+ const room=(cs,b0,e,dr,nx)=>{
+  const rs=new Set(cs),fl=[];for(const c of cs)fl[c]=1;fl[e]=1;
+  const gl=cs.filter(c=>Y[c]);
+  const ds=[];for(const s of cs){const d=new Array(W*H).fill(1/0);d[s]=0;const q=[s];for(let h=0;h<q.length;h++){let c=q[h];for(let k=0;k<4;k++){let x=c%W+D[k][0],y=(c/W|0)+D[k][1];if(ib(x,y)){let n=y*W+x;if(rs.has(n)&&d[n]>d[c]+1){d[n]=d[c]+1;q.push(n)}}}}ds[s]=d}
+  const heur=bs=>{let b=1/0;const r=(i,a,u)=>{if(a>=b)return;if(i===bs.length){b=a;return}for(let j=0;j<gl.length;j++)if(!(u>>j&1)){let d=ds[bs[i]][gl[j]];if(d<1/0)r(i+1,a+d,u|1<<j)}};r(0,0,0);return b};
+  const dl=bs=>{const s=new Set(bs);for(const b of bs){if(Y[b])continue;let x=b%W,y=b/W|0;
+   let U=!ib(x,y-1)||!fl[(y-1)*W+x],N=!ib(x,y+1)||!fl[(y+1)*W+x],Lf=!ib(x-1,y)||!fl[y*W+x-1],Rt=!ib(x+1,y)||!fl[y*W+x+1];
+   if((U||N)&&(Lf||Rt))return 1;
+   for(const[ox,oy]of[[-1,-1],[0,-1],[-1,0],[0,0]]){let bad=0;for(let a=0;a<4;a++){let cx=x+ox+(a&1),cy=y+oy+(a>>1);if(ib(cx,cy)){let c=cy*W+cx;if(Y[c]||(fl[c]&&!s.has(c)))bad=1}}if(!bad)return 1}}
+  return 0};
+  const key=(p,bs)=>String.fromCharCode(p,...bs);
+  const can=(p,bs)=>{let m=1/0;for(const c of bfs(p,fl,new Set(bs)).keys())if(c<m)m=c;return m};
+  let bs=[...b0].sort((a,b)=>a-b);
+  const NB=[bs],NP=[can(e,bs)],NG=[0],PA=[-1],PU=[[0,0]],be=new Map([[key(NP[0],bs),0]]),Hp=[];
+  const push=e=>{let i=Hp.length;Hp.push(e);while(i){let p=i-1>>1;if(Hp[p][0]<=e[0])break;Hp[i]=Hp[p];i=p}Hp[i]=e};
+  const pop=()=>{let t=Hp[0],l=Hp.pop();if(Hp.length){let i=0;for(;;){let c=2*i+1;if(c>=Hp.length)break;if(c+1<Hp.length&&Hp[c+1][0]<Hp[c][0])c++;if(Hp[c][0]>=l[0])break;Hp[i]=Hp[c];i=c}Hp[i]=l}return t};
+  if(heur(bs)===1/0||dl(bs))return null;
+  push([heur(bs),0]);
+  let xp=0;
+  while(Hp.length&&xp<1e6){
+   let[,s]=pop();bs=NB[s];let p=NP[s],g=NG[s];
+   if(be.get(key(p,bs))!==g)continue;
+   if(bs.every(b=>Y[b])){if(!nx||bfs(p,fl,new Set(bs)).has(dr)){let ps=[];for(let n=s;n>0;n=PA[n])ps.push(PU[n]);return ps.reverse()}}
+   xp++;
+   let rg=bfs(p,fl,new Set(bs)),st=new Set(bs);
+   for(let bi=0;bi<bs.length;bi++){let b=bs[bi];
+    for(let k=0;k<4;k++){let x=b%W+D[k][0],y=(b/W|0)+D[k][1];if(!ib(x,y))continue;let n=y*W+x,ph=(b/W|0)*W+b%W-D[k][1]*W-D[k][0];
+     if(!fl[n]||st.has(n)||!rg.has(ph))continue;
+     let nb=bs.slice();nb[bi]=n;nb.sort((a,c)=>a-c);
+     if(dl(nb))continue;let h=heur(nb);if(h===1/0)continue;
+     let np=can(b,nb),kk=key(np,nb),o=be.get(kk);
+     if(o!==undefined&&o<=g+1)continue;
+     let idx=NB.length;NB.push(nb);NP.push(np);NG.push(g+1);PA.push(s);PU.push([b,k]);be.set(kk,g+1);push([g+1+h,idx])}}}
+  return null};
+ let mv='',cp=P,AB=B,def=[];
+ const doRoom=(cs,nx)=>{
+  let b0=cs.filter(c=>AB.includes(c));
+  let drs=cs.filter(c=>{let x=c%W,y=c/W|0;for(let k=0;k<4;k++){let nx2=x+D[k][0],ny=y+D[k][1];if(ny===py&&ib(nx2,ny)&&F[ny*W+nx2])return 1}return 0});
+  if(!drs.length)return 0;
+  let dr=drs[0],e=(py)*W+dr%W;
+  let ps=room(cs,b0,e,dr,nx);
+  if(!ps)return 0;
+  let fl=[];for(const c of cs)fl[c]=1;fl[e]=1;
+  let w0=walk(cp,e,F,new Set(AB));if(w0===null)return 0;
+  mv+=w0;cp=e;
+  let cb=[...b0].sort((a,b)=>a-b);
+  for(let[fr,k]of ps){let ph=(fr/W|0)*W+fr%W-D[k][1]*W-D[k][0];
+   let wk=walk(cp,ph,fl,new Set(cb));if(wk===null)return 0;
+   mv+=wk+L[k];let n=(fr/W|0)*W+fr%W+D[k][1]*W+D[k][0];
+   cb=cb.map(b=>b===fr?n:b).sort((a,b)=>a-b);cp=fr;AB=AB.map(b=>b===fr?n:b)}
+  return 1};
+ for(const cs of rooms)if(!doRoom(cs,1))def.push(cs);
+ for(const cs of def)if(!doRoom(cs,0))return '';
+ return mv}
+for(const id of readdirSync(I).sort()){
+ const mv=solve(readFileSync(join(I,id,'level.txt'),'utf8'));
+ mkdirSync(join(O,id),{recursive:true});
+ writeFileSync(join(O,id,'solution.txt'),mv+'\n')}
